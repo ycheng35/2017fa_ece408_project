@@ -1,92 +1,149 @@
-
 #ifndef MXNET_OPERATOR_NEW_FORWARD_CUH_
 #define MXNET_OPERATOR_NEW_FORWARD_CUH_
 
+#define STREAM_TOT 32
+#define MAX_THREADS 256
+#define TILE_WIDTH_MULT 32
+
 #include <mxnet/base.h>
+
+
 
 namespace mxnet
 {
 namespace op
 {
 
+template<typename gpu, typename DType>
+__global__ void matrixMultiplyShared(DType *A, DType *B, DType *C,
+                                     int numARows, int numAColumns,
+                                     int numBRows, int numBColumns,
+                                     int numCRows, int numCColumns)
+{
 
+  __shared__ float subTileM[TILE_WIDTH_MULT][TILE_WIDTH_MULT];
+  __shared__ float subTileN[TILE_WIDTH_MULT][TILE_WIDTH_MULT];
+  int bx = blockIdx.x;  int by = blockIdx.y;
+  int tx = threadIdx.x;  int ty = threadIdx.y;
+  
+  int Row = by*TILE_WIDTH_MULT + ty;
+  int Col = bx*TILE_WIDTH_MULT + tx;
+  float pvalue = 0;
+  for (int m=0; m<(numAColumns-1)/TILE_WIDTH_MULT+1; ++m){
+    if (Row < numARows && m*TILE_WIDTH_MULT+tx < numAColumns){
+      subTileM[ty][tx] = A[Row*numAColumns + m*TILE_WIDTH_MULT+tx];
+    }
+    else {
+      subTileM[ty][tx] = 0;
+    }
+    if (Col < numBColumns && m*TILE_WIDTH_MULT+ty < numBRows){
+      subTileN[ty][tx] = B[(m*TILE_WIDTH_MULT+ty)*numBColumns + Col];
+    }
+    else {
+      subTileN[ty][tx] = 0;
+    }
+    __syncthreads();
+    if (Row < numARows && Col < numBColumns){
+      for (int k=0; k<TILE_WIDTH_MULT; ++k){
+        pvalue += subTileM[ty][k] * subTileN[k][tx];
+      }
+    }
+    __syncthreads();  
+  }
+  if (Row < numARows && Col < numBColumns){
+    C[Row*numCColumns+Col] = pvalue;
+  }
+  
+}
 
-
-__global__ void forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K) {
-
-    /*
-    Modify this function to implement the forward pass described in Chapter 16.
-    We have added an additional dimension to the tensors to support an entire mini-batch
-    The goal here is to be correct AND fast.
-    We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
-    */
-
-    const int H_out = H - K + 1;
-    const int W_out = W - K + 1;
-    (void)H_out; // silence declared but never referenced warning. remove this line when you start working
-    (void)W_out; // silence declared but never referenced warning. remove this line when you start working
-
-    // An example use of these macros:
-    // float a = y4d(0,0,0,0)
-    // y4d(0,0,0,0) = a
-    #define y4d(i3,i2,i1,i0) y[(i3) * (M * H_out * W_out) + (i2)*(H_out * W_out) + (i1)*(W_out) + i0]
-    #define x4d(i3,i2,i1,i0) x[(i3) * (C * H * W) + (i2)*(H * W) + (i1)*(W) + i0]
-    #define k4d(i3,i2,i1,i0) k[(i3) * (C * K * K) + (i2)*(K * K) + (i1)*(K) + i0]
-
-    /*
-        Your code here!
-    */
-
-    #undef y4d
-    #undef x4d
-    #undef k4d
+template<typename gpu, typename DType>
+__global__ void unroll_Kernel(int C, int H, int W, int K, DType* X, DType* X_unroll) {
+  int c, s, h_out, w_out, p, q, w_unroll, w_base, h_unroll;
+  int t = blockIdx.x * MAX_THREADS + threadIdx.x;
+  int H_out = H - K + 1;
+  int W_out = W - K + 1;
+  int W_unroll = H_out * W_out;
+  
+  #define x3d(i3,i2,i1) X[(i3) * (H * W) + (i2)*(W) + (i1)]
+  if (t < C*W_unroll) {
+    c = t/W_unroll;
+    s = t%W_unroll;
+    h_out = s/W_out;
+    w_out = s%W_out;
+    h_unroll = h_out * W_out + w_out;
+    w_base = c*K*K;
+    for(p = 0; p < K; p++) {
+      for(q = 0; q < K; q++) {
+        w_unroll = w_base + p * K + q;
+        //X_unroll[h_unroll, w_unroll] = X[c, h_out + p, w_out + q]
+        X_unroll[(w_unroll)*W_unroll + h_unroll] = x3d(c,(h_out + p),(w_out + q)); 
+      }
+    }
+  }
+  #undef x3d
 }
 
 
+// This function is called by new-inl.h
+// Any code you write should be executed by this function
+template<typename gpu, typename DType>
+void forward(mshadow::Tensor<gpu, 4, DType> &y, const mshadow::Tensor<gpu, 4, DType> &x, const mshadow::Tensor<gpu, 4, DType> &w) {
+    const int B = x.shape_[0];
+    const int C = x.shape_[1];
+    const int H = x.shape_[2];
+    const int W = x.shape_[3];
+    const int M = y.shape_[1];
+    const int K = w.shape_[3];
+    const int H_out = H - K + 1;
+    const int W_out = W - K + 1;
+
+    //variables
+    int HW = H_out*W_out;
+    int CHW = C*H_out*W_out;
+    int numARows = M;    
+    int numAColumns = C*K*K; 
+    int numBRows = C*K*K;
+    int numBColumns = H_out*W_out;
+    int numCRows = numARows;
+    int numCColumns = numBColumns;
+
+    DType* xout;
+    int curStream;
+    cudaStream_t s;
+
+    //use multiple stream to parallel the execution
+    cudaStream_t stream_arr[STREAM_TOT];
+    for (int i = 0; i < STREAM_TOT; ++i) {
+      cudaStreamCreate(&stream_arr[i]); 
+    }
+
+    cudaMalloc((void**) &xout, sizeof(DType) * HW * numAColumns * STREAM_TOT);
 
 
-/* 
-   This function is called by new-inl.h
-   Any code you write should be executed by this function.
-   For ECE408, we only expect the float version of the operator to be called, so here we specialize with only floats.
-*/
-template<>
-void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tensor<gpu, 4, float> &x, const mshadow::Tensor<gpu, 4, float> &w) {
-    
+    for (int n = 0; n < B; n++) {
+        curStream = n % STREAM_TOT;
+        s = stream_arr[curStream];
 
-    // Use mxnet's CHECK_EQ to do assertions.
-    // Remove this assertion when you do your implementation!
-    CHECK_EQ(0, 1) << "Missing an ECE408 GPU implementation!";
+        int blockDim = ceil(float(CHW) / float(MAX_THREADS));
+        unroll_Kernel <gpu, DType> <<<blockDim, MAX_THREADS, 0, s>>> (C, H, W, K, x.dptr_ + n*C*H*W, xout+curStream*HW*numAColumns);
 
-    // You'll probably need to launch kernels against the right stream to keep MXNet happy
-    // cudaStream_t s = y.stream_->stream_;
 
-    // Extract the tensor dimensions into B,M,C,H,W,K
-    // ...
+        //matrix multiply
+        dim3 DimGrid((numCColumns-1)/TILE_WIDTH_MULT+1, (numCRows-1)/TILE_WIDTH_MULT+1, 1);
+        dim3 DimBlock(TILE_WIDTH_MULT, TILE_WIDTH_MULT, 1);
 
-    // Set the kernel dimensions
-    // dim3 gridDim(0);
-    // dim3 blockDim(0);
-
-    // Call the kernel
-    // forward_kernel<<<gridDim, blockDim, 0, s>>>(y.dptr_,x.dptr_,w.dptr_, B,M,C,H,W,K);
+        matrixMultiplyShared <gpu, DType> <<<DimGrid, DimBlock, 2*TILE_WIDTH_MULT*TILE_WIDTH_MULT, s>>> (w.dptr_, xout+curStream*HW*numAColumns, y.dptr_+n*M*H_out*W_out,numARows, numAColumns,                                      numBRows, numBColumns, numCRows, numCColumns);
+    }
 
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
     MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
-
 }
 
 
-/* 
-    This tells mxnet how to do an op when it's not a float.
-    This is not used in the ECE408 project
-*/
-template<typename gpu, typename DType>
-void forward(mshadow::Tensor<gpu, 4, DType> &y, const mshadow::Tensor<gpu, 4, DType> &x, const mshadow::Tensor<gpu, 4, DType> &w) {
-    assert( 0 && "No forward implementation for other datatypes needed for ECE408");
-}
 
 }
 }
 
 #endif
+
+
